@@ -1,15 +1,58 @@
+// Covers config environment-variable substitution behavior.
 import { describe, expect, it } from "vitest";
-import { MissingEnvVarError, resolveConfigEnvVars } from "./env-substitution.js";
+import {
+  type EnvSubstitutionWarning,
+  MissingEnvVarError,
+  containsEnvVarReference,
+  resolveConfigEnvVars,
+} from "./env-substitution.js";
+import {
+  createConfigResolutionFacts,
+  getAuthoredConfigSecretRef,
+  getResolvedConfigEnvSecretRef,
+  setConfigResolutionFacts,
+} from "./resolution-facts.js";
+
+type SubstitutionScenario = {
+  name: string;
+  config: unknown;
+  env: Record<string, string>;
+  expected: unknown;
+};
+
+type MissingEnvScenario = {
+  name: string;
+  config: unknown;
+  env: Record<string, string>;
+  varName: string;
+  configPath: string;
+};
+
+function expectResolvedScenarios(scenarios: SubstitutionScenario[]) {
+  for (const scenario of scenarios) {
+    const result = resolveConfigEnvVars(scenario.config, scenario.env);
+    expect(result, scenario.name).toEqual(scenario.expected);
+  }
+}
+
+function expectMissingScenarios(scenarios: MissingEnvScenario[]) {
+  for (const scenario of scenarios) {
+    try {
+      resolveConfigEnvVars(scenario.config, scenario.env);
+      expect.fail(`${scenario.name}: expected MissingEnvVarError`);
+    } catch (err) {
+      expect(err, scenario.name).toBeInstanceOf(MissingEnvVarError);
+      const error = err as MissingEnvVarError;
+      expect(error.varName, scenario.name).toBe(scenario.varName);
+      expect(error.configPath, scenario.name).toBe(scenario.configPath);
+    }
+  }
+}
 
 describe("resolveConfigEnvVars", () => {
   describe("basic substitution", () => {
     it("substitutes direct, inline, repeated, and multi-var patterns", () => {
-      const scenarios: Array<{
-        name: string;
-        config: unknown;
-        env: Record<string, string>;
-        expected: unknown;
-      }> = [
+      const scenarios: SubstitutionScenario[] = [
         {
           name: "single env var",
           config: { key: "${FOO}" },
@@ -36,21 +79,13 @@ describe("resolveConfigEnvVars", () => {
         },
       ];
 
-      for (const scenario of scenarios) {
-        const result = resolveConfigEnvVars(scenario.config, scenario.env);
-        expect(result, scenario.name).toEqual(scenario.expected);
-      }
+      expectResolvedScenarios(scenarios);
     });
   });
 
   describe("nested structures", () => {
     it("substitutes variables in nested objects and arrays", () => {
-      const scenarios: Array<{
-        name: string;
-        config: unknown;
-        env: Record<string, string>;
-        expected: unknown;
-      }> = [
+      const scenarios: SubstitutionScenario[] = [
         {
           name: "nested object",
           config: { outer: { inner: { key: "${API_KEY}" } } },
@@ -81,22 +116,13 @@ describe("resolveConfigEnvVars", () => {
         },
       ];
 
-      for (const scenario of scenarios) {
-        const result = resolveConfigEnvVars(scenario.config, scenario.env);
-        expect(result, scenario.name).toEqual(scenario.expected);
-      }
+      expectResolvedScenarios(scenarios);
     });
   });
 
   describe("missing env var handling", () => {
     it("throws MissingEnvVarError with var name and config path details", () => {
-      const scenarios: Array<{
-        name: string;
-        config: unknown;
-        env: Record<string, string>;
-        varName: string;
-        configPath: string;
-      }> = [
+      const scenarios: MissingEnvScenario[] = [
         {
           name: "missing top-level var",
           config: { key: "${MISSING}" },
@@ -119,6 +145,65 @@ describe("resolveConfigEnvVars", () => {
           configPath: "items[1]",
         },
         {
+          name: "dotted plugin ID remains one record key",
+          config: { plugins: { entries: { "foo.config.bar": { token: "${MISSING}" } } } },
+          env: {},
+          varName: "MISSING",
+          configPath: 'plugins.entries["foo.config.bar"].token',
+        },
+        {
+          name: "dotted header remains one record key",
+          config: {
+            plugins: { entries: { fixture: { config: { headers: { "X.Trace": "${MISSING}" } } } } },
+          },
+          env: {},
+          varName: "MISSING",
+          configPath: 'plugins.entries.fixture.config.headers["X.Trace"]',
+        },
+        {
+          name: "nested header segments remain dotted",
+          config: {
+            plugins: {
+              entries: { fixture: { config: { headers: { X: { Trace: "${MISSING}" } } } } },
+            },
+          },
+          env: {},
+          varName: "MISSING",
+          configPath: "plugins.entries.fixture.config.headers.X.Trace",
+        },
+        {
+          name: "numeric-looking record key is not an array index",
+          config: {
+            plugins: { entries: { fixture: { config: { headers: { "0": "${MISSING}" } } } } },
+          },
+          env: {},
+          varName: "MISSING",
+          configPath: 'plugins.entries.fixture.config.headers["0"]',
+        },
+        {
+          name: "existing non-plugin root record paths stay unchanged",
+          config: { "root.key": "${MISSING}" },
+          env: {},
+          varName: "MISSING",
+          configPath: "root.key",
+        },
+        {
+          name: "plugin config array indices remain canonical",
+          config: {
+            plugins: { entries: { fixture: { config: { headers: ["${MISSING}"] } } } },
+          },
+          env: {},
+          varName: "MISSING",
+          configPath: "plugins.entries.fixture.config.headers[0]",
+        },
+        {
+          name: "hyphenated record key keeps its existing dotted spelling",
+          config: { providers: { "vercel-gateway": { apiKey: "${MISSING}" } } },
+          env: {},
+          varName: "MISSING",
+          configPath: "providers.vercel-gateway.apiKey",
+        },
+        {
           name: "empty string env value treated as missing",
           config: { key: "${EMPTY}" },
           env: { EMPTY: "" },
@@ -127,28 +212,13 @@ describe("resolveConfigEnvVars", () => {
         },
       ];
 
-      for (const scenario of scenarios) {
-        try {
-          resolveConfigEnvVars(scenario.config, scenario.env);
-          expect.fail(`${scenario.name}: expected MissingEnvVarError`);
-        } catch (err) {
-          expect(err, scenario.name).toBeInstanceOf(MissingEnvVarError);
-          const error = err as MissingEnvVarError;
-          expect(error.varName, scenario.name).toBe(scenario.varName);
-          expect(error.configPath, scenario.name).toBe(scenario.configPath);
-        }
-      }
+      expectMissingScenarios(scenarios);
     });
   });
 
   describe("escape syntax", () => {
     it("handles escaped placeholders alongside regular substitutions", () => {
-      const scenarios: Array<{
-        name: string;
-        config: unknown;
-        env: Record<string, string>;
-        expected: unknown;
-      }> = [
+      const scenarios: SubstitutionScenario[] = [
         {
           name: "escaped placeholder stays literal",
           config: { key: "$${VAR}" },
@@ -187,21 +257,13 @@ describe("resolveConfigEnvVars", () => {
         },
       ];
 
-      for (const scenario of scenarios) {
-        const result = resolveConfigEnvVars(scenario.config, scenario.env);
-        expect(result, scenario.name).toEqual(scenario.expected);
-      }
+      expectResolvedScenarios(scenarios);
     });
   });
 
   describe("pattern matching rules", () => {
     it("leaves non-matching placeholders unchanged", () => {
-      const scenarios: Array<{
-        name: string;
-        config: unknown;
-        env: Record<string, string>;
-        expected: unknown;
-      }> = [
+      const scenarios: SubstitutionScenario[] = [
         {
           name: "$VAR (no braces)",
           config: { key: "$VAR" },
@@ -228,19 +290,11 @@ describe("resolveConfigEnvVars", () => {
         },
       ];
 
-      for (const scenario of scenarios) {
-        const result = resolveConfigEnvVars(scenario.config, scenario.env);
-        expect(result, scenario.name).toEqual(scenario.expected);
-      }
+      expectResolvedScenarios(scenarios);
     });
 
     it("substitutes valid uppercase/underscore placeholder names", () => {
-      const scenarios: Array<{
-        name: string;
-        config: unknown;
-        env: Record<string, string>;
-        expected: unknown;
-      }> = [
+      const scenarios: SubstitutionScenario[] = [
         {
           name: "underscore-prefixed name",
           config: { key: "${_UNDERSCORE_START}" },
@@ -255,10 +309,7 @@ describe("resolveConfigEnvVars", () => {
         },
       ];
 
-      for (const scenario of scenarios) {
-        const result = resolveConfigEnvVars(scenario.config, scenario.env);
-        expect(result, scenario.name).toEqual(scenario.expected);
-      }
+      expectResolvedScenarios(scenarios);
     });
   });
 
@@ -285,14 +336,144 @@ describe("resolveConfigEnvVars", () => {
     });
   });
 
+  describe("graceful missing env var handling (onMissing)", () => {
+    it("keeps pending and resolved SecretRef provenance distinct across config paths", () => {
+      const pendingEnvSecretRefs = new Map<string, string>();
+      const resolvedEnvSecretRefs = new Map<string, string>();
+      const config = resolveConfigEnvVars(
+        {
+          plugins: {
+            entries: {
+              "foo.config.bar": { config: { token: "$ATTACKER" } },
+              foo: {
+                config: {
+                  bar: { config: { token: "$VICTIM" } },
+                  headers: {
+                    "X.Trace": "$DOTTED_HEADER",
+                    X: { Trace: "$NESTED_HEADER" },
+                  },
+                },
+              },
+            },
+          },
+          models: {
+            providers: {
+              "alpha:beta": {
+                apiKey: "$CORE_PROVIDER",
+                headers: { "X.Trace": "$CORE_HEADER" },
+              },
+            },
+          },
+          resolved: "${RESOLVED_SECRET}",
+        },
+        { RESOLVED_SECRET: "resolved-value" },
+        {
+          onPendingEnvSecretRef: (id, configPath) => pendingEnvSecretRefs.set(configPath, id),
+          onResolvedEnvSecretRef: (id, configPath) => resolvedEnvSecretRefs.set(configPath, id),
+        },
+      );
+      setConfigResolutionFacts(
+        config,
+        createConfigResolutionFacts([], pendingEnvSecretRefs, undefined, resolvedEnvSecretRefs),
+      );
+
+      expect([...pendingEnvSecretRefs]).toEqual([
+        ['plugins.entries["foo.config.bar"].config.token', "ATTACKER"],
+        ["plugins.entries.foo.config.bar.config.token", "VICTIM"],
+        ['plugins.entries.foo.config.headers["X.Trace"]', "DOTTED_HEADER"],
+        ["plugins.entries.foo.config.headers.X.Trace", "NESTED_HEADER"],
+        ["models.providers.alpha:beta.apiKey", "CORE_PROVIDER"],
+        ["models.providers.alpha:beta.headers.X.Trace", "CORE_HEADER"],
+      ]);
+      expect([...resolvedEnvSecretRefs]).toEqual([["resolved", "RESOLVED_SECRET"]]);
+      for (const [configPath, id] of pendingEnvSecretRefs) {
+        expect(getAuthoredConfigSecretRef(config, configPath), configPath).toEqual({
+          source: "env",
+          provider: "default",
+          id,
+        });
+      }
+      expect(getAuthoredConfigSecretRef(config, "resolved")).toBeNull();
+      expect(getResolvedConfigEnvSecretRef(config, "resolved")).toEqual({
+        source: "env",
+        provider: "default",
+        id: "RESOLVED_SECRET",
+      });
+    });
+
+    it("collects warnings and preserves placeholder when onMissing is set", () => {
+      const warnings: EnvSubstitutionWarning[] = [];
+      const result = resolveConfigEnvVars(
+        { key: "${MISSING_VAR}", present: "${PRESENT}" },
+        { PRESENT: "ok" },
+        { onMissing: (w) => warnings.push(w) },
+      );
+      expect(result).toEqual({ key: "${MISSING_VAR}", present: "ok" });
+      expect(warnings).toEqual([{ varName: "MISSING_VAR", configPath: "key" }]);
+    });
+
+    it("collects multiple warnings across nested paths", () => {
+      const warnings: EnvSubstitutionWarning[] = [];
+      const result = resolveConfigEnvVars(
+        {
+          providers: {
+            tts: { apiKey: "${TTS_KEY}" },
+            stt: { apiKey: "${STT_KEY}" },
+          },
+          gateway: { token: "${GW_TOKEN}" },
+        },
+        { GW_TOKEN: "secret" },
+        { onMissing: (w) => warnings.push(w) },
+      );
+      expect(result).toEqual({
+        providers: {
+          tts: { apiKey: "${TTS_KEY}" },
+          stt: { apiKey: "${STT_KEY}" },
+        },
+        gateway: { token: "secret" },
+      });
+      expect(warnings).toHaveLength(2);
+      expect(warnings[0]).toEqual({ varName: "TTS_KEY", configPath: "providers.tts.apiKey" });
+      expect(warnings[1]).toEqual({ varName: "STT_KEY", configPath: "providers.stt.apiKey" });
+    });
+
+    it("still throws when onMissing is not set", () => {
+      expect(() => resolveConfigEnvVars({ key: "${MISSING}" }, {})).toThrow(MissingEnvVarError);
+    });
+  });
+
+  describe("containsEnvVarReference", () => {
+    it("detects unresolved env var placeholders", () => {
+      expect(containsEnvVarReference("${FOO}")).toBe(true);
+      expect(containsEnvVarReference("prefix-${VAR}-suffix")).toBe(true);
+      expect(containsEnvVarReference("${A}/${B}")).toBe(true);
+      expect(containsEnvVarReference("${_UNDERSCORE}")).toBe(true);
+      expect(containsEnvVarReference("${VAR_WITH_123}")).toBe(true);
+    });
+
+    it("returns false for non-matching patterns", () => {
+      expect(containsEnvVarReference("no-refs-here")).toBe(false);
+      expect(containsEnvVarReference("$VAR")).toBe(false);
+      expect(containsEnvVarReference("${lowercase}")).toBe(false);
+      expect(containsEnvVarReference("${MixedCase}")).toBe(false);
+      expect(containsEnvVarReference("${123INVALID}")).toBe(false);
+      expect(containsEnvVarReference("")).toBe(false);
+    });
+
+    it("returns false for escaped placeholders", () => {
+      expect(containsEnvVarReference("$${ESCAPED}")).toBe(false);
+      expect(containsEnvVarReference("prefix-$${ESCAPED}-suffix")).toBe(false);
+    });
+
+    it("detects references mixed with escaped placeholders", () => {
+      expect(containsEnvVarReference("$${ESCAPED} ${REAL}")).toBe(true);
+      expect(containsEnvVarReference("${REAL} $${ESCAPED}")).toBe(true);
+    });
+  });
+
   describe("real-world config patterns", () => {
     it("substitutes provider, gateway, and base URL config values", () => {
-      const scenarios: Array<{
-        name: string;
-        config: unknown;
-        env: Record<string, string>;
-        expected: unknown;
-      }> = [
+      const scenarios: SubstitutionScenario[] = [
         {
           name: "provider API keys",
           config: {
@@ -342,10 +523,7 @@ describe("resolveConfigEnvVars", () => {
         },
       ];
 
-      for (const scenario of scenarios) {
-        const result = resolveConfigEnvVars(scenario.config, scenario.env);
-        expect(result, scenario.name).toEqual(scenario.expected);
-      }
+      expectResolvedScenarios(scenarios);
     });
   });
 });

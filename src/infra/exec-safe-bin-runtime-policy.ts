@@ -1,3 +1,4 @@
+// Resolves runtime safe-bin policy and trust warnings.
 import { resolveSafeBins } from "./exec-approvals-allowlist.js";
 import {
   normalizeSafeBinProfileFixtures,
@@ -6,9 +7,15 @@ import {
   type SafeBinProfileFixture,
   type SafeBinProfileFixtures,
 } from "./exec-safe-bin-policy.js";
-import { getTrustedSafeBinDirs, normalizeTrustedSafeBinDirs } from "./exec-safe-bin-trust.js";
+import { normalizeSafeBinName } from "./exec-safe-bin-semantics.js";
+import {
+  getTrustedSafeBinDirs,
+  listWritableExplicitTrustedSafeBinDirs,
+  normalizeTrustedSafeBinDirs,
+  type WritableTrustedSafeBinDir,
+} from "./exec-safe-bin-trust.js";
 
-export type ExecSafeBinConfigScope = {
+type ExecSafeBinConfigScope = {
   safeBins?: string[] | null;
   safeBinProfiles?: SafeBinProfileFixtures | null;
   safeBinTrustedDirs?: string[] | null;
@@ -16,6 +23,7 @@ export type ExecSafeBinConfigScope = {
 
 const INTERPRETER_LIKE_SAFE_BINS = new Set([
   "ash",
+  "awk",
   "bash",
   "busybox",
   "bun",
@@ -25,8 +33,12 @@ const INTERPRETER_LIKE_SAFE_BINS = new Set([
   "dash",
   "deno",
   "fish",
+  "gawk",
+  "gsed",
   "ksh",
   "lua",
+  "mawk",
+  "nawk",
   "node",
   "nodejs",
   "perl",
@@ -40,6 +52,7 @@ const INTERPRETER_LIKE_SAFE_BINS = new Set([
   "python2",
   "python3",
   "ruby",
+  "sed",
   "sh",
   "toybox",
   "wscript",
@@ -54,15 +67,7 @@ const INTERPRETER_LIKE_PATTERNS = [
   /^node\d+(?:\.\d+)?$/,
 ];
 
-function normalizeSafeBinName(raw: string): string {
-  const trimmed = raw.trim().toLowerCase();
-  if (!trimmed) {
-    return "";
-  }
-  const tail = trimmed.split(/[\\/]/).at(-1);
-  return tail ?? trimmed;
-}
-
+/** Returns true for safeBins that can interpret scripts or execute broad embedded programs. */
 export function isInterpreterLikeSafeBin(raw: string): boolean {
   const normalized = normalizeSafeBinName(raw);
   if (!normalized) {
@@ -74,6 +79,7 @@ export function isInterpreterLikeSafeBin(raw: string): boolean {
   return INTERPRETER_LIKE_PATTERNS.some((pattern) => pattern.test(normalized));
 }
 
+/** Lists normalized interpreter-like safeBins from a configured entry set. */
 export function listInterpreterLikeSafeBins(entries: Iterable<string>): string[] {
   return Array.from(entries)
     .map((entry) => normalizeSafeBinName(entry))
@@ -81,6 +87,7 @@ export function listInterpreterLikeSafeBins(entries: Iterable<string>): string[]
     .toSorted();
 }
 
+/** Merges global and local safe-bin profile fixtures, with local definitions winning. */
 export function resolveMergedSafeBinProfileFixtures(params: {
   global?: ExecSafeBinConfigScope | null;
   local?: ExecSafeBinConfigScope | null;
@@ -96,15 +103,18 @@ export function resolveMergedSafeBinProfileFixtures(params: {
   };
 }
 
+/** Resolves safe-bin names, profiles, trusted dirs, and warning metadata for exec evaluation. */
 export function resolveExecSafeBinRuntimePolicy(params: {
   global?: ExecSafeBinConfigScope | null;
   local?: ExecSafeBinConfigScope | null;
+  onWarning?: (message: string) => void;
 }): {
   safeBins: Set<string>;
   safeBinProfiles: Readonly<Record<string, SafeBinProfile>>;
   trustedSafeBinDirs: ReadonlySet<string>;
   unprofiledSafeBins: string[];
   unprofiledInterpreterSafeBins: string[];
+  writableTrustedSafeBinDirs: ReadonlyArray<WritableTrustedSafeBinDir>;
 } {
   const safeBins = resolveSafeBins(params.local?.safeBins ?? params.global?.safeBins);
   const safeBinProfiles = resolveSafeBinProfiles(
@@ -116,17 +126,36 @@ export function resolveExecSafeBinRuntimePolicy(params: {
   const unprofiledSafeBins = Array.from(safeBins)
     .filter((entry) => !safeBinProfiles[entry])
     .toSorted();
+  const explicitTrustedSafeBinDirs = [
+    ...normalizeTrustedSafeBinDirs(params.global?.safeBinTrustedDirs),
+    ...normalizeTrustedSafeBinDirs(params.local?.safeBinTrustedDirs),
+  ];
   const trustedSafeBinDirs = getTrustedSafeBinDirs({
-    extraDirs: [
-      ...normalizeTrustedSafeBinDirs(params.global?.safeBinTrustedDirs),
-      ...normalizeTrustedSafeBinDirs(params.local?.safeBinTrustedDirs),
-    ],
+    extraDirs: explicitTrustedSafeBinDirs,
+    safeBins: Array.from(safeBins),
   });
+  const writableTrustedSafeBinDirs = listWritableExplicitTrustedSafeBinDirs(
+    explicitTrustedSafeBinDirs,
+  );
+  if (params.onWarning) {
+    for (const hit of writableTrustedSafeBinDirs) {
+      const scope =
+        hit.worldWritable || hit.groupWritable
+          ? hit.worldWritable
+            ? "world-writable"
+            : "group-writable"
+          : "writable";
+      params.onWarning(
+        `exec: safeBinTrustedDirs includes ${scope} directory '${hit.dir}'; remove trust or tighten permissions (for example chmod 755).`,
+      );
+    }
+  }
   return {
     safeBins,
     safeBinProfiles,
     trustedSafeBinDirs,
     unprofiledSafeBins,
     unprofiledInterpreterSafeBins: listInterpreterLikeSafeBins(unprofiledSafeBins),
+    writableTrustedSafeBinDirs,
   };
 }
