@@ -1,52 +1,36 @@
-import { randomUUID } from "node:crypto";
-import fs from "node:fs/promises";
-import path from "node:path";
+import { writeTextAtomic as writeFsSafeTextAtomic } from "@openclaw/fs-safe/atomic";
 
-export async function readJsonFile<T>(filePath: string): Promise<T | null> {
-  try {
-    const raw = await fs.readFile(filePath, "utf8");
-    return JSON.parse(raw) as T;
-  } catch {
-    return null;
-  }
-}
+export {
+  JsonFileReadError,
+  readJson,
+  readJson as readJsonFileStrict, // Sanctioned domain alias.
+  readJsonIfExists,
+  readJsonIfExists as readDurableJsonFile, // Sanctioned domain alias.
+  readJsonSync,
+  readRootJsonObjectSync,
+  readRootJsonSync,
+  readRootStructuredFileSync,
+  tryReadJson,
+  tryReadJson as readJsonFile, // Sanctioned domain alias.
+  tryReadJsonSync,
+  tryReadJsonSync as readJsonFileSync, // Sanctioned domain alias.
+  writeJson,
+  writeJson as writeJsonAtomic, // Sanctioned domain alias.
+  writeJsonSync,
+} from "@openclaw/fs-safe/json";
 
-export async function writeJsonAtomic(
-  filePath: string,
-  value: unknown,
-  options?: { mode?: number },
-) {
-  const mode = options?.mode ?? 0o600;
-  const dir = path.dirname(filePath);
-  await fs.mkdir(dir, { recursive: true });
-  const tmp = `${filePath}.${randomUUID()}.tmp`;
-  await fs.writeFile(tmp, JSON.stringify(value, null, 2), "utf8");
-  try {
-    await fs.chmod(tmp, mode);
-  } catch {
-    // best-effort; ignore on platforms without chmod
-  }
-  await fs.rename(tmp, filePath);
-  try {
-    await fs.chmod(filePath, mode);
-  } catch {
-    // best-effort; ignore on platforms without chmod
-  }
-}
+export { createAsyncLock } from "@openclaw/fs-safe/advanced";
 
-export function createAsyncLock() {
-  let lock: Promise<void> = Promise.resolve();
-  return async function withLock<T>(fn: () => Promise<T>): Promise<T> {
-    const prev = lock;
-    let release: (() => void) | undefined;
-    lock = new Promise<void>((resolve) => {
-      release = resolve;
-    });
-    await prev;
-    try {
-      return await fn();
-    } finally {
-      release?.();
-    }
-  };
-}
+export type { WriteTextAtomicOptions } from "@openclaw/fs-safe/atomic";
+
+export const writeTextAtomic: typeof writeFsSafeTextAtomic = async (filePath, content, options) => {
+  // The public SDK treats empty prefixes as defaults and ignores unrelated options.
+  await writeFsSafeTextAtomic(filePath, content, {
+    mode: options?.mode,
+    dirMode: options?.dirMode,
+    trailingNewline: options?.trailingNewline,
+    durable: options?.durable,
+    beforeRename: options?.beforeRename || undefined,
+    tempPrefix: options?.tempPrefix || undefined,
+  });
+};

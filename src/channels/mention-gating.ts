@@ -1,59 +1,95 @@
-export type MentionGateParams = {
-  requireMention: boolean;
+import type { ChannelImplicitMentionsConfig } from "../config/types.channels.js";
+
+export type InboundImplicitMentionKind =
+  | "reply_to_bot"
+  | "quoted_bot"
+  | "bot_thread_participant"
+  | "native";
+
+export type InboundMentionFacts = {
   canDetectMention: boolean;
   wasMentioned: boolean;
-  implicitMention?: boolean;
-  shouldBypassMention?: boolean;
+  hasAnyMention?: boolean;
+  implicitMentionKinds?: readonly InboundImplicitMentionKind[];
 };
 
-export type MentionGateResult = {
-  effectiveWasMentioned: boolean;
-  shouldSkip: boolean;
-};
-
-export type MentionGateWithBypassParams = {
+export type InboundMentionPolicy = {
   isGroup: boolean;
   requireMention: boolean;
-  canDetectMention: boolean;
-  wasMentioned: boolean;
-  implicitMention?: boolean;
-  hasAnyMention?: boolean;
+  implicitMentions?: ChannelImplicitMentionsConfig;
+  allowedImplicitMentionKinds?: readonly InboundImplicitMentionKind[];
   allowTextCommands: boolean;
   hasControlCommand: boolean;
   commandAuthorized: boolean;
 };
 
-export type MentionGateWithBypassResult = MentionGateResult & {
+/** @deprecated Prefer the nested `{ facts, policy }` call shape for new code. */
+export type ResolveInboundMentionDecisionFlatParams = InboundMentionFacts & InboundMentionPolicy;
+
+export type ResolveInboundMentionDecisionNestedParams = {
+  facts: InboundMentionFacts;
+  policy: InboundMentionPolicy;
+};
+
+export type ResolveInboundMentionDecisionParams =
+  | ResolveInboundMentionDecisionFlatParams
+  | ResolveInboundMentionDecisionNestedParams;
+
+export type InboundMentionDecision = {
+  effectiveWasMentioned: boolean;
+  shouldSkip: boolean;
+  implicitMention: boolean;
+  matchedImplicitMentionKinds: InboundImplicitMentionKind[];
   shouldBypassMention: boolean;
 };
 
-export function resolveMentionGating(params: MentionGateParams): MentionGateResult {
-  const implicit = params.implicitMention === true;
-  const bypass = params.shouldBypassMention === true;
-  const effectiveWasMentioned = params.wasMentioned || implicit || bypass;
-  const shouldSkip = params.requireMention && params.canDetectMention && !effectiveWasMentioned;
-  return { effectiveWasMentioned, shouldSkip };
+export function implicitMentionKindWhen(
+  kind: InboundImplicitMentionKind,
+  enabled: boolean,
+): InboundImplicitMentionKind[] {
+  return enabled ? [kind] : [];
 }
 
-export function resolveMentionGatingWithBypass(
-  params: MentionGateWithBypassParams,
-): MentionGateWithBypassResult {
+/** Translates positive implicit-mention policy into the evaluator's kind allowlist. */
+export function allowedImplicitMentionKindsFromConfig(
+  config: ChannelImplicitMentionsConfig,
+): InboundImplicitMentionKind[] {
+  return [
+    ...implicitMentionKindWhen("reply_to_bot", config.replyToBot !== false),
+    ...implicitMentionKindWhen("quoted_bot", config.quotedBot !== false),
+    ...implicitMentionKindWhen("bot_thread_participant", config.threadParticipation !== false),
+    "native",
+  ];
+}
+
+export function resolveInboundMentionDecision(
+  params: ResolveInboundMentionDecisionParams,
+): InboundMentionDecision {
+  const { facts, policy } =
+    "facts" in params && "policy" in params ? params : { facts: params, policy: params };
+  const allowedImplicitMentionKinds =
+    policy.allowedImplicitMentionKinds ??
+    (policy.implicitMentions
+      ? allowedImplicitMentionKindsFromConfig(policy.implicitMentions)
+      : undefined);
   const shouldBypassMention =
-    params.isGroup &&
-    params.requireMention &&
-    !params.wasMentioned &&
-    !(params.hasAnyMention ?? false) &&
-    params.allowTextCommands &&
-    params.commandAuthorized &&
-    params.hasControlCommand;
+    policy.isGroup &&
+    policy.requireMention &&
+    !facts.wasMentioned &&
+    !(facts.hasAnyMention ?? false) &&
+    policy.allowTextCommands &&
+    policy.commandAuthorized &&
+    policy.hasControlCommand;
+  const matchedImplicitMentionKinds = [...new Set(facts.implicitMentionKinds ?? [])].filter(
+    (kind) => !allowedImplicitMentionKinds || allowedImplicitMentionKinds.includes(kind),
+  );
+  const implicitMention = matchedImplicitMentionKinds.length > 0;
+  const effectiveWasMentioned = facts.wasMentioned || implicitMention || shouldBypassMention;
   return {
-    ...resolveMentionGating({
-      requireMention: params.requireMention,
-      canDetectMention: params.canDetectMention,
-      wasMentioned: params.wasMentioned,
-      implicitMention: params.implicitMention,
-      shouldBypassMention,
-    }),
+    implicitMention,
+    matchedImplicitMentionKinds,
+    effectiveWasMentioned,
     shouldBypassMention,
+    shouldSkip: policy.requireMention && facts.canDetectMention && !effectiveWasMentioned,
   };
 }

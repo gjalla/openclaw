@@ -1,13 +1,28 @@
-import { callGateway } from "../../gateway/call.js";
-import { logVerbose } from "../../globals.js";
+import { expectDefined } from "@openclaw/normalization-core";
+// Implements approval commands for pending exec, plugin, and OpenClaw change requests.
+import { normalizeLowercaseStringOrEmpty } from "@openclaw/normalization-core/string-coerce";
 import {
-  GATEWAY_CLIENT_MODES,
-  GATEWAY_CLIENT_NAMES,
-  isInternalMessageChannel,
-} from "../../utils/message-channel.js";
+  getChannelPlugin,
+  resolveChannelApprovalCapability,
+} from "../../channels/plugins/index.js";
+import { logVerbose } from "../../globals.js";
+import { isApprovalNotFoundError } from "../../infra/approval-errors.js";
+import {
+  isPendingSystemAgentApprovalOverGateway,
+  resolveApprovalOverGateway,
+} from "../../infra/approval-gateway-resolver.js";
+import type { ChannelApprovalKind } from "../../infra/approval-types.js";
+import {
+  resolveApprovalCommandAuthorization,
+  type ApprovalCommandAuthorization,
+} from "../../infra/channel-approval-auth.js";
+import { formatErrorMessage } from "../../infra/errors.js";
+import { resolveChannelAccountId } from "./channel-context.js";
+import { commandReply, requireGatewayClientScope } from "./command-gates.js";
 import type { CommandHandler } from "./commands-types.js";
 
-const COMMAND = "/approve";
+const COMMAND_REGEX = /^\/?approve(?:\s|$)/i;
+const FOREIGN_COMMAND_MENTION_REGEX = /^\/approve@([^\s]+)(?:\s|$)/i;
 
 const DECISION_ALIASES: Record<string, "allow-once" | "allow-always" | "deny"> = {
   allow: "allow-once",
@@ -26,47 +41,72 @@ type ParsedApproveCommand =
   | { ok: true; id: string; decision: "allow-once" | "allow-always" | "deny" }
   | { ok: false; error: string };
 
+const APPROVE_USAGE_TEXT =
+  "Usage: /approve <id> <decision> (see the pending approval message for available decisions)";
+
 function parseApproveCommand(raw: string): ParsedApproveCommand | null {
   const trimmed = raw.trim();
-  if (!trimmed.toLowerCase().startsWith(COMMAND)) {
+  if (FOREIGN_COMMAND_MENTION_REGEX.test(trimmed)) {
+    return { ok: false, error: "❌ This /approve command targets a different Telegram bot." };
+  }
+  const commandMatch = trimmed.match(COMMAND_REGEX);
+  if (!commandMatch) {
     return null;
   }
-  const rest = trimmed.slice(COMMAND.length).trim();
+  const rest = trimmed.slice(commandMatch[0].length).trim();
   if (!rest) {
-    return { ok: false, error: "Usage: /approve <id> allow-once|allow-always|deny" };
+    return { ok: false, error: APPROVE_USAGE_TEXT };
   }
   const tokens = rest.split(/\s+/).filter(Boolean);
   if (tokens.length < 2) {
-    return { ok: false, error: "Usage: /approve <id> allow-once|allow-always|deny" };
+    return { ok: false, error: APPROVE_USAGE_TEXT };
   }
 
-  const first = tokens[0].toLowerCase();
-  const second = tokens[1].toLowerCase();
+  const first = normalizeLowercaseStringOrEmpty(tokens[0]);
+  const second = normalizeLowercaseStringOrEmpty(tokens[1]);
 
-  if (DECISION_ALIASES[first]) {
+  // Decision tokens are chat-supplied, so inherited keys such as "constructor"
+  // or "__proto__" must not read through to Object.prototype.
+  const firstDecision = Object.hasOwn(DECISION_ALIASES, first)
+    ? DECISION_ALIASES[first]
+    : undefined;
+  if (firstDecision) {
     return {
       ok: true,
-      decision: DECISION_ALIASES[first],
+      decision: firstDecision,
       id: tokens.slice(1).join(" ").trim(),
     };
   }
-  if (DECISION_ALIASES[second]) {
+  const secondDecision = Object.hasOwn(DECISION_ALIASES, second)
+    ? DECISION_ALIASES[second]
+    : undefined;
+  if (secondDecision) {
     return {
       ok: true,
-      decision: DECISION_ALIASES[second],
-      id: tokens[0],
+      decision: secondDecision,
+      id: expectDefined(tokens[0], "tokens entry at 0"),
     };
   }
-  return { ok: false, error: "Usage: /approve <id> allow-once|allow-always|deny" };
+  return { ok: false, error: APPROVE_USAGE_TEXT };
 }
 
-function buildResolvedByLabel(params: Parameters<CommandHandler>[0]): string {
+type ApproveCommandParams = Pick<Parameters<CommandHandler>[0], "cfg" | "command" | "ctx">;
+
+function buildResolvedByLabel(params: ApproveCommandParams): string {
   const channel = params.command.channel;
   const sender = params.command.senderId ?? "unknown";
   return `${channel}:${sender}`;
 }
 
-export const handleApproveCommand: CommandHandler = async (params, allowTextCommands) => {
+type ApproveCommandBehavior =
+  | { kind: "allow" }
+  | { kind: "ignore" }
+  | { kind: "reply"; text: string };
+
+export async function handleApproveCommandFromContext(
+  params: ApproveCommandParams,
+  allowTextCommands: boolean,
+) {
   if (!allowTextCommands) {
     return null;
   }
@@ -75,51 +115,185 @@ export const handleApproveCommand: CommandHandler = async (params, allowTextComm
   if (!parsed) {
     return null;
   }
-  if (!params.command.isAuthorizedSender) {
+  if (!parsed.ok) {
+    return commandReply(parsed.error);
+  }
+
+  const effectiveAccountId = resolveChannelAccountId({
+    cfg: params.cfg,
+    ctx: params.ctx,
+    command: params.command,
+  });
+  // Probe order: legacy exec/plugin resolution reports not-found for other
+  // owners; system-agent resolution reads the owner first (see below).
+  const approvalKinds = ["exec", "plugin", "system-agent"] as const;
+  const authorize = (kind: ChannelApprovalKind) =>
+    resolveApprovalCommandAuthorization({
+      cfg: params.cfg,
+      channel: params.command.channel,
+      accountId: effectiveAccountId,
+      senderId: params.command.senderId,
+      kind,
+    });
+  const authorizations: Record<(typeof approvalKinds)[number], ApprovalCommandAuthorization> = {
+    exec: authorize("exec"),
+    plugin: authorize("plugin"),
+    "system-agent": authorize("system-agent"),
+  };
+  const hasExplicitApprovalAuthorization = Object.values(authorizations).some(
+    (authorization) => authorization.explicit && authorization.authorized,
+  );
+  if (!params.command.isAuthorizedSender && !hasExplicitApprovalAuthorization) {
     logVerbose(
       `Ignoring /approve from unauthorized sender: ${params.command.senderId || "<unknown>"}`,
     );
     return { shouldContinue: false };
   }
 
-  if (!parsed.ok) {
-    return { shouldContinue: false, reply: { text: parsed.error } };
+  const missingScope = requireGatewayClientScope(params, {
+    label: "/approve",
+    allowedScopes: ["operator.approvals", "operator.admin"],
+    missingText: "❌ /approve requires operator.approvals for gateway clients.",
+  });
+  if (missingScope) {
+    return missingScope;
   }
 
-  if (isInternalMessageChannel(params.command.channel)) {
-    const scopes = params.ctx.GatewayClientScopes ?? [];
-    const hasApprovals = scopes.includes("operator.approvals") || scopes.includes("operator.admin");
-    if (!hasApprovals) {
-      logVerbose("Ignoring /approve from gateway client missing operator.approvals.");
-      return {
-        shouldContinue: false,
-        reply: {
-          text: "❌ /approve requires operator.approvals for gateway clients.",
-        },
-      };
+  const approvalCapability = resolveChannelApprovalCapability(
+    getChannelPlugin(params.command.channel),
+  );
+  // Channels with reviewer custody let the Gateway judge the actor; elsewhere an
+  // OpenClaw change needs the current configured owner, like the tool that proposed it.
+  const systemAgentNeedsOwner = !approvalCapability?.authorizeActorAction;
+  const commandBehaviors = new Map<ChannelApprovalKind, ApproveCommandBehavior | undefined>();
+  for (const approvalKind of approvalKinds) {
+    commandBehaviors.set(
+      approvalKind,
+      approvalCapability?.resolveApproveCommandBehavior?.({
+        cfg: params.cfg,
+        accountId: effectiveAccountId,
+        senderId: params.command.senderId,
+        approvalKind,
+      }),
+    );
+  }
+  const blockedCommandResult = (): Awaited<ReturnType<CommandHandler>> => {
+    const replyBehavior = Array.from(commandBehaviors.values()).find(
+      (behavior) => behavior?.kind === "reply",
+    );
+    if (replyBehavior?.kind === "reply") {
+      return commandReply(replyBehavior.text);
+    }
+    if (Array.from(commandBehaviors.values()).some((behavior) => behavior?.kind === "ignore")) {
+      return { shouldContinue: false };
+    }
+    return null;
+  };
+
+  const resolvedBy = buildResolvedByLabel(params);
+  const callApprovalMethod = async (approvalKind: ChannelApprovalKind): Promise<void> => {
+    // Channel senders deciding an OpenClaw change carry their identity so the
+    // Gateway's final decision guard rechecks live custody (channel approvers,
+    // or else configured owner). Gateway clients are authorized by their scopes.
+    const reviewer =
+      approvalCapability?.authorizeActorAction ||
+      (approvalKind === "system-agent" && !Array.isArray(params.ctx.GatewayClientScopes))
+        ? {
+            channel: params.command.channel,
+            accountId: effectiveAccountId,
+            senderId: params.command.senderId,
+          }
+        : {};
+    const clientDisplayName = `Chat approval (${resolvedBy})`;
+    if (approvalKind !== "system-agent") {
+      await resolveApprovalOverGateway({
+        cfg: params.cfg,
+        approvalId: parsed.id,
+        decision: parsed.decision,
+        ...reviewer,
+        resolveMethod: approvalKind,
+        clientDisplayName,
+      });
+      return;
+    }
+    // Canonical resolution denies an approval addressed with the wrong owner,
+    // so confirm the owner before submitting the decision.
+    const isSystemAgentApproval = await isPendingSystemAgentApprovalOverGateway({
+      cfg: params.cfg,
+      approvalId: parsed.id,
+      clientDisplayName,
+    });
+    if (!isSystemAgentApproval) {
+      throw new Error("unknown or expired approval id");
+    }
+    if (systemAgentNeedsOwner) {
+      try {
+        params.command.assertOwnerCurrent?.();
+      } catch {
+        throw new Error("your owner authority changed; send /approve again");
+      }
+    }
+    await resolveApprovalOverGateway({
+      cfg: params.cfg,
+      approvalId: parsed.id,
+      decision: parsed.decision,
+      ...reviewer,
+      approvalKind,
+      clientDisplayName,
+    });
+  };
+
+  const systemAgentRefusedForOwner =
+    systemAgentNeedsOwner &&
+    !params.command.senderIsOwner &&
+    authorizations["system-agent"].authorized;
+  const ownerOnlyResult = commandReply(
+    "❌ Only the owner can approve OpenClaw changes in this chat.",
+  );
+  const methods = approvalKinds.filter((approvalKind) => {
+    if (approvalKind === "system-agent" && systemAgentRefusedForOwner) {
+      return false;
+    }
+    const behavior = commandBehaviors.get(approvalKind);
+    return authorizations[approvalKind].authorized && (!behavior || behavior.kind === "allow");
+  });
+  if (methods.length === 0) {
+    const blocked = blockedCommandResult();
+    if (blocked) {
+      return blocked;
+    }
+    if (systemAgentRefusedForOwner) {
+      return ownerOnlyResult;
+    }
+    return commandReply(
+      Object.values(authorizations).find((authorization) => authorization.reason)?.reason ??
+        "❌ You are not authorized to approve this request.",
+    );
+  }
+
+  for (const [index, method] of methods.entries()) {
+    try {
+      await callApprovalMethod(method);
+      break;
+    } catch (error) {
+      if (isApprovalNotFoundError(error)) {
+        if (index < methods.length - 1) {
+          continue;
+        }
+        const blocked = blockedCommandResult();
+        if (blocked) {
+          return blocked;
+        }
+        // Not an exec or plugin approval; it may be a change only the owner can decide.
+        if (systemAgentRefusedForOwner) {
+          return ownerOnlyResult;
+        }
+      }
+      return commandReply(`❌ Failed to submit approval: ${formatErrorMessage(error)}`);
     }
   }
 
-  const resolvedBy = buildResolvedByLabel(params);
-  try {
-    await callGateway({
-      method: "exec.approval.resolve",
-      params: { id: parsed.id, decision: parsed.decision },
-      clientName: GATEWAY_CLIENT_NAMES.GATEWAY_CLIENT,
-      clientDisplayName: `Chat approval (${resolvedBy})`,
-      mode: GATEWAY_CLIENT_MODES.BACKEND,
-    });
-  } catch (err) {
-    return {
-      shouldContinue: false,
-      reply: {
-        text: `❌ Failed to submit approval: ${String(err)}`,
-      },
-    };
-  }
+  return commandReply(`✅ Approval ${parsed.decision} submitted for ${parsed.id}.`);
+}
 
-  return {
-    shouldContinue: false,
-    reply: { text: `✅ Exec approval ${parsed.decision} submitted for ${parsed.id}.` },
-  };
-};
+export const handleApproveCommand: CommandHandler = handleApproveCommandFromContext;

@@ -1,8 +1,16 @@
-import fs from "node:fs";
-import path from "node:path";
+// Windows launcher normalization for npm/bun wrappers that duplicate node.exe in argv.
+import { normalizeLowercaseStringOrEmpty } from "@openclaw/normalization-core/string-coerce";
 
-export function normalizeWindowsArgv(argv: string[]): string[] {
-  if (process.platform !== "win32") {
+/** Remove duplicated Windows node launcher argv entries while preserving normal POSIX argv. */
+export function normalizeWindowsArgv(
+  argv: string[],
+  options: {
+    platform?: NodeJS.Platform;
+    execPath?: string;
+  } = {},
+): string[] {
+  const platform = options.platform ?? process.platform;
+  if (platform !== "win32") {
     return argv;
   }
   if (argv.length < 2) {
@@ -20,16 +28,16 @@ export function normalizeWindowsArgv(argv: string[]): string[] {
     return out;
   };
 
-  const normalizeArg = (value: string): string =>
+  const normalizeCandidate = (value: string): string =>
     stripControlChars(value)
       .replace(/^['"]+|['"]+$/g, "")
-      .trim();
-  const normalizeCandidate = (value: string): string =>
-    normalizeArg(value).replace(/^\\\\\\?\\/, "");
+      .trim()
+      .replace(/^\\\\\\?\\/, "");
+  const basename = (value: string): string => value.split(/[\\/]/).pop() ?? value;
 
-  const execPath = normalizeCandidate(process.execPath);
-  const execPathLower = execPath.toLowerCase();
-  const execBase = path.basename(execPath).toLowerCase();
+  const execPath = normalizeCandidate(options.execPath ?? process.execPath);
+  const execPathLower = normalizeLowercaseStringOrEmpty(execPath);
+  const execBase = normalizeLowercaseStringOrEmpty(basename(execPath));
   const isExecPath = (value: string | undefined): boolean => {
     if (!value) {
       return false;
@@ -38,41 +46,14 @@ export function normalizeWindowsArgv(argv: string[]): string[] {
     if (!normalized) {
       return false;
     }
-    const lower = normalized.toLowerCase();
-    return (
-      lower === execPathLower ||
-      path.basename(lower) === execBase ||
-      lower.endsWith("\\node.exe") ||
-      lower.endsWith("/node.exe") ||
-      lower.includes("node.exe") ||
-      (path.basename(lower) === "node.exe" && fs.existsSync(normalized))
-    );
+    const lower = normalizeLowercaseStringOrEmpty(normalized);
+    const base = basename(lower);
+    return lower === execPathLower || base === execBase || base === "node.exe";
   };
 
   const next = [...argv];
-  for (let i = 1; i <= 3 && i < next.length; ) {
-    if (isExecPath(next[i])) {
-      next.splice(i, 1);
-      continue;
-    }
-    i += 1;
+  while (isExecPath(next[1])) {
+    next.splice(1, 1);
   }
-  const filtered = next.filter((arg, index) => index === 0 || !isExecPath(arg));
-  if (filtered.length < 3) {
-    return filtered;
-  }
-  const cleaned = [...filtered];
-  for (let i = 2; i < cleaned.length; ) {
-    const arg = cleaned[i];
-    if (!arg || arg.startsWith("-")) {
-      i += 1;
-      continue;
-    }
-    if (isExecPath(arg)) {
-      cleaned.splice(i, 1);
-      continue;
-    }
-    break;
-  }
-  return cleaned;
+  return next;
 }

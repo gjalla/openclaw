@@ -4,8 +4,6 @@ import SwiftUI
 struct TranscriptTextView: NSViewRepresentable {
     @Binding var text: String
     var attributed: NSAttributedString
-    var isFinal: Bool
-    var isOverflowing: Bool
     var onBeginEditing: () -> Void
     var onEscape: () -> Void
     var onEndEditing: () -> Void
@@ -183,6 +181,11 @@ private final class TranscriptNSTextView: NSTextView {
         let isEscape = event.keyCode == 53
         if isEscape {
             self.onEscape?()
+            return
+        }
+        // Keep IME candidate confirmation behavior: Return should commit marked text first.
+        if isReturn, self.hasMarkedText() {
+            super.keyDown(with: event)
             return
         }
         if isReturn, event.modifierFlags.contains(.command) {

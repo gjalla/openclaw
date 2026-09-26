@@ -1,10 +1,28 @@
-import { ConsoleLogger, LogService } from "@vector-im/matrix-bot-sdk";
+import {
+  logger as matrixJsSdkRootLogger,
+  type Logger as MatrixJsSdkLogger,
+} from "matrix-js-sdk/lib/logger.js";
+import { ConsoleLogger, LogService, setMatrixConsoleLogging } from "../sdk/logger.js";
 
 let matrixSdkLoggingConfigured = false;
+let matrixSdkLogMode: "default" | "quiet" = "default";
 const matrixSdkBaseLogger = new ConsoleLogger();
+let matrixJsSdkRootLoggerSnapshot: MatrixJsSdkRootLoggerSnapshot | null = null;
+
+type MatrixJsSdkLoglevelLogger = {
+  getLevel?: () => number | string;
+  methodFactory?: unknown;
+  rebuild?: () => void;
+  setLevel?: (level: number | string, persist?: boolean) => void;
+};
+
+type MatrixJsSdkRootLoggerSnapshot = {
+  level?: number | string;
+  methodFactory?: unknown;
+};
 
 function shouldSuppressMatrixHttpNotFound(module: string, messageOrObject: unknown[]): boolean {
-  if (module !== "MatrixHttpClient") {
+  if (!module.includes("MatrixHttpClient")) {
     return false;
   }
   return messageOrObject.some((entry) => {
@@ -16,11 +34,36 @@ function shouldSuppressMatrixHttpNotFound(module: string, messageOrObject: unkno
 }
 
 export function ensureMatrixSdkLoggingConfigured(): void {
-  if (matrixSdkLoggingConfigured) {
+  matrixSdkLoggingConfigured = true;
+  applyMatrixSdkLogger();
+}
+
+export function setMatrixSdkLogMode(mode: "default" | "quiet"): void {
+  matrixSdkLogMode = mode;
+  if (!matrixSdkLoggingConfigured) {
     return;
   }
-  matrixSdkLoggingConfigured = true;
+  applyMatrixSdkLogger();
+}
 
+export function setMatrixSdkConsoleLogging(enabled: boolean): void {
+  setMatrixConsoleLogging(enabled);
+}
+
+function applyMatrixSdkLogger(): void {
+  if (matrixSdkLogMode === "quiet") {
+    setMatrixJsSdkRootLoggerLevel("silent");
+    LogService.setLogger({
+      trace: () => {},
+      debug: () => {},
+      info: () => {},
+      warn: () => {},
+      error: () => {},
+    });
+    return;
+  }
+
+  setMatrixJsSdkRootLoggerLevel("debug");
   LogService.setLogger({
     trace: (module, ...messageOrObject) => matrixSdkBaseLogger.trace(module, ...messageOrObject),
     debug: (module, ...messageOrObject) => matrixSdkBaseLogger.debug(module, ...messageOrObject),
@@ -33,4 +76,50 @@ export function ensureMatrixSdkLoggingConfigured(): void {
       matrixSdkBaseLogger.error(module, ...messageOrObject);
     },
   });
+}
+
+function setMatrixJsSdkRootLoggerLevel(level: "debug" | "silent"): void {
+  const logger = matrixJsSdkRootLogger as unknown as MatrixJsSdkLoglevelLogger;
+  matrixJsSdkRootLoggerSnapshot ??= {
+    level: logger.getLevel?.(),
+    methodFactory: logger.methodFactory,
+  };
+  if (level === "silent") {
+    logger.methodFactory = () => () => undefined;
+    logger.setLevel?.("silent", false);
+    logger.rebuild?.();
+    return;
+  }
+  logger.methodFactory = matrixJsSdkRootLoggerSnapshot.methodFactory;
+  const previousLevel = matrixJsSdkRootLoggerSnapshot.level;
+  if (typeof previousLevel === "string" || typeof previousLevel === "number") {
+    logger.setLevel?.(previousLevel, false);
+  }
+  logger.rebuild?.();
+}
+
+export function createMatrixJsSdkClientLogger(prefix = "matrix"): MatrixJsSdkLogger {
+  const log = (method: keyof ConsoleLogger, ...messageOrObject: unknown[]): void => {
+    if (matrixSdkLogMode === "quiet") {
+      return;
+    }
+    matrixSdkBaseLogger[method](prefix, ...messageOrObject);
+  };
+
+  return {
+    trace: (...messageOrObject) => log("trace", ...messageOrObject),
+    debug: (...messageOrObject) => log("debug", ...messageOrObject),
+    info: (...messageOrObject) => log("info", ...messageOrObject),
+    warn: (...messageOrObject) => log("warn", ...messageOrObject),
+    error: (...messageOrObject) => {
+      if (shouldSuppressMatrixHttpNotFound(prefix, messageOrObject)) {
+        return;
+      }
+      log("error", ...messageOrObject);
+    },
+    getChild: (namespace: string) => {
+      const nextNamespace = namespace.trim();
+      return createMatrixJsSdkClientLogger(nextNamespace ? `${prefix}.${nextNamespace}` : prefix);
+    },
+  };
 }

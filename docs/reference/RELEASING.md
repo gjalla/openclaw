@@ -1,121 +1,249 @@
 ---
-title: "Release Checklist"
-summary: "Step-by-step release checklist for npm + macOS app"
+doc-schema-version: 1
+summary: "OpenClaw release channels, version numbers, validation, and published assets"
+title: "Release policy"
 read_when:
-  - Cutting a new npm release
-  - Cutting a new macOS app release
-  - Verifying metadata before publishing
+  - Choosing a release channel
+  - Understanding version numbers and release checks
+  - Checking which packages and apps have been published
 ---
 
-# Release Checklist (npm + macOS)
+OpenClaw offers stable releases for everyday use, beta releases for testing,
+and extended-stable releases for users who prefer an older Gateway maintenance
+line. This page explains those choices and what a release has been checked for.
+For switching channels, see [Release channels](/install/development-channels).
 
-Use `pnpm` (Node 22+) from the repo root. Keep the working tree clean before tagging/publishing.
+## Release channels
 
-## Operator trigger
+| Channel         | What you get                                                                                              |
+| --------------- | --------------------------------------------------------------------------------------------------------- |
+| Stable          | The regular release promoted to npm `latest`.                                                             |
+| Beta            | A candidate on npm `beta`. This may be a prerelease or a final version awaiting promotion.                |
+| Extended-stable | A Gateway maintenance release from either of the two trailing completed months, on npm `extended-stable`. |
+| Dev             | The moving head of `main`, for development.                                                               |
 
-When the operator says “release”, immediately do this preflight (no extra questions unless blocked):
+Extended-stable includes the Gateway, official npm plugins, and Docker images.
+It does not include native apps or ClawHub publication, and it does not change
+the regular stable channel. Its GitHub release is not marked Latest. A monthly
+line retires when it falls outside the two supported completed months.
 
-- Read this doc and `docs/platforms/mac/release.md`.
-- Load env from `~/.profile` and confirm `SPARKLE_PRIVATE_KEY_FILE` + App Store Connect vars are set (SPARKLE_PRIVATE_KEY_FILE should live in `~/.profile`).
-- Use Sparkle keys from `~/Library/CloudStorage/Dropbox/Backup/Sparkle` if needed.
+Alpha builds are a separate internal testing track, not a recommended user
+channel.
 
-1. **Version & metadata**
+## Version naming
 
-- [ ] Bump `package.json` version (e.g., `2026.1.29`).
-- [ ] Run `pnpm plugins:sync` to align extension package versions + changelogs.
-- [ ] Update CLI/version strings in [`src/version.ts`](https://github.com/openclaw/openclaw/blob/main/src/version.ts) and the Baileys user agent in [`src/web/session.ts`](https://github.com/openclaw/openclaw/blob/main/src/web/session.ts).
-- [ ] Confirm package metadata (name, description, repository, keywords, license) and `bin` map points to [`openclaw.mjs`](https://github.com/openclaw/openclaw/blob/main/openclaw.mjs) for `openclaw`.
-- [ ] If dependencies changed, run `pnpm install` so `pnpm-lock.yaml` is current.
+| Release            | Version example                                                       |
+| ------------------ | --------------------------------------------------------------------- |
+| Regular final      | `2026.9.6`                                                            |
+| Beta prerelease    | `2026.9.6-beta.1`                                                     |
+| Regular correction | `2026.9.6-1`                                                          |
+| Extended-stable    | `2026.8.33`, followed by `2026.8.34` for its next maintenance release |
 
-2. **Build & artifacts**
+Versions use `year.month.patch`, without zero-padding. The patch is a release
+number within the month, not a day of the month. Regular releases use patches
+below `33`; extended-stable starts at `33`. Git tags add `v`, as in `v2026.9.6`.
 
-- [ ] If A2UI inputs changed, run `pnpm canvas:a2ui:bundle` and commit any updated [`src/canvas-host/a2ui/a2ui.bundle.js`](https://github.com/openclaw/openclaw/blob/main/src/canvas-host/a2ui/a2ui.bundle.js).
-- [ ] `pnpm run build` (regenerates `dist/`).
-- [ ] Verify npm package `files` includes all required `dist/*` folders (notably `dist/node-host/**` and `dist/acp/**` for headless node + ACP CLI).
-- [ ] Confirm `dist/build-info.json` exists and includes the expected `commit` hash (CLI banner uses this for npm installs).
-- [ ] Optional: `npm pack --pack-destination /tmp` after the build; inspect the tarball contents and keep it handy for the GitHub release (do **not** commit it).
+Published npm versions and release tags are never replaced. A fix receives a
+new version. Alpha-only versions do not advance the regular release number.
 
-3. **Changelog & docs**
+## Release cadence
 
-- [ ] Update `CHANGELOG.md` with user-facing highlights (create the file if missing); keep entries strictly descending by version.
-- [ ] Ensure README examples/flags match current CLI behavior (notably new commands or options).
+Releases normally go to beta first and move to stable after validation.
+For core and every published official npm plugin, `beta` must be at least as
+new as `latest`; an already newer beta stays unchanged. A prerelease is older
+than the final version with the same base number.
 
-4. **Validation**
+A final version published to the beta channel still has to meet the stable
+validation requirements below. The npm channel alone does not determine which
+checks apply.
 
-- [ ] `pnpm build`
-- [ ] `pnpm check`
-- [ ] `pnpm test` (or `pnpm test:coverage` if you need coverage output)
-- [ ] `pnpm release:check` (verifies npm pack contents)
-- [ ] `OPENCLAW_INSTALL_SMOKE_SKIP_NONROOT=1 pnpm test:install:smoke` (Docker install smoke test, fast path; required before release)
-  - If the immediate previous npm release is known broken, set `OPENCLAW_INSTALL_SMOKE_PREVIOUS=<last-good-version>` or `OPENCLAW_INSTALL_SMOKE_SKIP_PREVIOUS=1` for the preinstall step.
-- [ ] (Optional) Full installer smoke (adds non-root + CLI coverage): `pnpm test:install:smoke`
-- [ ] (Optional) Installer E2E (Docker, runs `curl -fsSL https://openclaw.ai/install.sh | bash`, onboards, then runs real tool calls):
-  - `pnpm test:install:e2e:openai` (requires `OPENAI_API_KEY`)
-  - `pnpm test:install:e2e:anthropic` (requires `ANTHROPIC_API_KEY`)
-  - `pnpm test:install:e2e` (requires both keys; runs both providers)
-- [ ] (Optional) Spot-check the web gateway if your changes affect send/receive paths.
+## Release validation
 
-5. **macOS app (Sparkle)**
+Stable publication requires stable or full validation, longer-running soak tests,
+and blocking performance checks. These requirements also apply to a final version
+first published on the beta channel. Beta-profile evidence cannot qualify stable.
 
-- [ ] Build + sign the macOS app, then zip it for distribution.
-- [ ] Generate the Sparkle appcast (HTML notes via [`scripts/make_appcast.sh`](https://github.com/openclaw/openclaw/blob/main/scripts/make_appcast.sh)) and update `appcast.xml`.
-- [ ] Keep the app zip (and optional dSYM zip) ready to attach to the GitHub release.
-- [ ] Follow [macOS release](/platforms/mac/release) for the exact commands and required env vars.
-  - `APP_BUILD` must be numeric + monotonic (no `-beta`) so Sparkle compares versions correctly.
-  - If notarizing, use the `openclaw-notary` keychain profile created from App Store Connect API env vars (see [macOS release](/platforms/mac/release)).
+Every selected validation lane must pass; publication waivers cannot bypass
+failures or required coverage. Validation covers source CI, packages, plugins,
+Gateway installs and upgrades, and selected app, UI, Telegram, QA, and
+live-provider checks. All-group qualification includes all nine Gateway
+install/upgrade combinations across Linux, Windows, and macOS. Coverage otherwise
+varies by profile and selected operating systems. Check the release's recorded
+coverage: skipped or deferred checks are not passes.
 
-6. **Publish (npm)**
+See [Full release validation](/reference/full-release-validation) for coverage
+by profile and how to interpret the results.
 
-- [ ] Confirm git status is clean; commit and push as needed.
-- [ ] `npm login` (verify 2FA) if needed.
-- [ ] `npm publish --access public` (use `--tag beta` for pre-releases).
-- [ ] Verify the registry: `npm view openclaw version`, `npm view openclaw dist-tags`, and `npx -y openclaw@X.Y.Z --version` (or `--help`).
+## Packages and apps can become available at different times
 
-### Troubleshooting (notes from 2.0.0-beta2 release)
+A published Gateway release does not mean every native app is ready. Signing and publishing the apps can
+finish separately from npm, Docker, and the GitHub release.
 
-- **npm pack/publish hangs or produces huge tarball**: the macOS app bundle in `dist/OpenClaw.app` (and release zips) get swept into the package. Fix by whitelisting publish contents via `package.json` `files` (include dist subdirs, docs, skills; exclude app bundles). Confirm with `npm pack --dry-run` that `dist/OpenClaw.app` is not listed.
-- **npm auth web loop for dist-tags**: use legacy auth to get an OTP prompt:
-  - `NPM_CONFIG_AUTH_TYPE=legacy npm dist-tag add openclaw@X.Y.Z latest`
-- **`npx` verification fails with `ECOMPROMISED: Lock compromised`**: retry with a fresh cache:
-  - `NPM_CONFIG_CACHE=/tmp/npm-cache-$(date +%s) npx -y openclaw@X.Y.Z --version`
-- **Tag needs repointing after a late fix**: force-update and push the tag, then ensure the GitHub release assets still match:
-  - `git tag -f vX.Y.Z && git push -f origin vX.Y.Z`
+Check the release's assets and announcements for each platform. A pending app
+build or an accepted publication request is not a completed app release.
+Extended-stable is a Gateway distribution and does not publish native apps.
 
-7. **GitHub release + appcast**
+## Release notes and verification
 
-- [ ] Tag and push: `git tag vX.Y.Z && git push origin vX.Y.Z` (or `git push --tags`).
-- [ ] Create/refresh the GitHub release for `vX.Y.Z` with **title `openclaw X.Y.Z`** (not just the tag); body should include the **full** changelog section for that version (Highlights + Changes + Fixes), inline (no bare links), and **must not repeat the title inside the body**.
-- [ ] Attach artifacts: `npm pack` tarball (optional), `OpenClaw-X.Y.Z.zip`, and `OpenClaw-X.Y.Z.dSYM.zip` (if generated).
-- [ ] Commit the updated `appcast.xml` and push it (Sparkle feeds from main).
-- [ ] From a clean temp directory (no `package.json`), run `npx -y openclaw@X.Y.Z send --help` to confirm install/CLI entrypoints work.
-- [ ] Announce/share release notes.
+The [release notes](/releases) describe user-facing changes. GitHub releases
+also carry validation results, dependency reports, and checks of the published
+packages. These records identify the tested version and the files that shipped.
+Later documentation updates may improve the release notes without rebuilding
+or replacing packages.
 
-## Plugin publish scope (npm)
+For dependency review, see [Dependency locking](/gateway/security/dependency-locking).
+Release dependency archives include npm-format locks separately from the
+package tarballs.
 
-We only publish **existing npm plugins** under the `@openclaw/*` scope. Bundled
-plugins that are not on npm stay **disk-tree only** (still shipped in
-`extensions/**`).
+### Downstream packaging
 
-Process to derive the list:
+To consume a release lock:
 
-1. `npm search @openclaw --json` and capture the package names.
-2. Compare with `extensions/*/package.json` names.
-3. Publish only the **intersection** (already on npm).
+1. Download `openclaw-<version>-dependency-evidence.zip` from the GitHub release.
+   Open `dependency-evidence/npm-package-locks.json` (`schemaVersion: 1`) and
+   select the `packages` entry matching the exact package `name` and `version`.
+2. Reject entries with a nonempty `omittedWorkspaceDependencies` array. These
+   are partial locks: the generator omits sibling `workspace:` runtime dependencies
+   that publish in the same release. The report counts these entries in
+   `packagesWithOmittedWorkspaceDependencies`.
+3. Verify that `dependency-evidence/dependency-evidence-manifest.json`'s
+   `releaseSha`, the report's `sourceSha`, and the OpenClaw commit you pin all
+   match. The report also records the source `pnpm-lock.yaml` SHA-256.
+4. Serialize `entry.lock` as `package-lock.json` using two-space JSON indentation
+   and a trailing newline, then verify its SHA-256 against `entry.lockSha256`.
+5. Before `npm ci`, carry the source `pnpm-workspace.yaml` overrides into the
+   consuming `package.json`, or rewrite nested `dependencies` and
+   `optionalDependencies` specs to their locked versions. The generated locks
+   encode workspace overrides, so unmodified specs can fail npm's lock-sync check.
 
-Current npm plugin list (update as needed):
+The companion `npm-package-locks.md` includes counts and a package table. Each
+entry records `bundleRuntimeDependencies` and direct dependency counts so
+packagers can identify lockless packages that need an external lock.
 
-- @openclaw/bluebubbles
-- @openclaw/diagnostics-otel
-- @openclaw/discord
-- @openclaw/feishu
-- @openclaw/lobster
-- @openclaw/matrix
-- @openclaw/msteams
-- @openclaw/nextcloud-talk
-- @openclaw/nostr
-- @openclaw/voice-call
-- @openclaw/zalo
-- @openclaw/zalouser
+## Maintainer procedures
 
-Release notes must also call out **new optional bundled plugins** that are **not
-on by default** (example: `tlon`).
+Release preparation, publishing commands, approvals, and recovery live in the
+[release-maintainer skill](https://github.com/openclaw/openclaw/tree/main/.agents/skills/release-openclaw-maintainer).
+Credential handling and emergency procedures remain in the private maintainer
+runbook. Former section links below lead to their corresponding procedures.
+
+<a id="linux-companion-publication" />
+
+[Linux publication](https://github.com/openclaw/openclaw/blob/main/.agents/skills/release-openclaw-maintainer/references/platform-publication.md#linux).
+
+<a id="release-changelog-artifacts" />
+
+[Release changelogs](https://github.com/openclaw/openclaw/blob/main/.agents/skills/release-openclaw-maintainer/references/preparation.md#changelog-and-release-notes).
+
+<a id="changelog-only-evidence-reuse" />
+
+[Changelog-only qualification](https://github.com/openclaw/openclaw/blob/main/.agents/skills/release-openclaw-maintainer/references/regular-release.md#qualify-publication-bytes).
+
+<a id="monthly-gateway-extended-stable-publication" />
+<a id="prepare-and-stabilize-the-candidate" />
+<a id="publish-the-npm-packages" />
+<a id="publish-the-release" />
+
+[Extended-stable preparation and publication](https://github.com/openclaw/openclaw/blob/main/.agents/skills/release-openclaw-maintainer/references/extended-stable-publish.md).
+
+<a id="verify-and-recover" />
+
+[Extended-stable recovery](https://github.com/openclaw/openclaw/blob/main/.agents/skills/release-openclaw-maintainer/references/extended-stable-publish.md#trusted-main-npm-recovery).
+
+<a id="regular-release-operator-checklist" />
+<a id="fast-path-default" />
+<a id="fast-path-(default)" />
+<a id="stable-release-process" />
+<a id="full-checklist" />
+<a id="manual-fallback" />
+
+[Regular release checklist](https://github.com/openclaw/openclaw/blob/main/.agents/skills/release-openclaw-maintainer/references/regular-release.md#freeze-and-validate-code).
+
+<a id="orchestrated-stable-release" />
+
+[Resumable release orchestration](https://github.com/openclaw/openclaw/blob/main/.agents/skills/release-openclaw-maintainer/references/regular-release.md#orchestrated-stable-release).
+
+<a id="release-priority" />
+
+[Deferred CI recovery](https://github.com/openclaw/openclaw/blob/main/.agents/skills/release-openclaw-ci/SKILL.md#deferred-ci-recovery).
+
+<a id="continuous-release-readiness" />
+
+[Nightly validation reuse](https://github.com/openclaw/openclaw/blob/main/.agents/skills/release-openclaw-ci/SKILL.md#continuous-release-readiness).
+
+<a id="release-tooling-fast-lane" />
+
+[Release tooling CI scope](https://github.com/openclaw/openclaw/blob/main/.agents/skills/release-openclaw-ci/SKILL.md#release-tooling-fast-lane).
+
+<a id="stable-main-closeout" />
+
+[Stable main closeout](https://github.com/openclaw/openclaw/blob/main/.agents/skills/release-openclaw-maintainer/references/stable-main-closeout.md).
+
+<a id="post-release-documentation-publication" />
+
+[Post-release documentation publication](https://github.com/openclaw/openclaw/blob/main/.agents/skills/openclaw-changelog-update/SKILL.md#post-release-docs-mirrors).
+
+<a id="release-preflight" />
+<a id="required-checks" />
+
+[Source and package gates](https://github.com/openclaw/openclaw/blob/main/.agents/skills/release-openclaw-maintainer/references/validation.md#source-and-package-gates).
+
+<a id="previous-updater-compatibility" />
+
+[Older updater verification](https://github.com/openclaw/openclaw/blob/main/.agents/skills/release-openclaw-maintainer/references/validation.md#older-updater-checks).
+
+<a id="design-proposal%3A-immutable-runtime-generations" />
+<a id="design-proposal-immutable-runtime-generations" />
+
+[Runtime generation design proposal (not shipped behavior)](https://github.com/openclaw/openclaw/blob/main/.agents/skills/release-openclaw-maintainer/references/validation.md#immutable-runtime-generation-proposal).
+
+<a id="release-test-boxes" />
+<a id="vitest" />
+<a id="docker" />
+<a id="qa-lab" />
+
+[Release validation lanes](https://github.com/openclaw/openclaw/blob/main/.agents/skills/release-openclaw-ci/SKILL.md#dispatch).
+
+<a id="package" />
+
+[Package Acceptance](/ci/release-validation/package-acceptance).
+
+<a id="regular-release-publish-automation" />
+<a id="check-publication-gates" />
+
+[Publication qualification](https://github.com/openclaw/openclaw/blob/main/.agents/skills/release-openclaw-maintainer/references/regular-release.md#qualify-publication-bytes).
+
+<a id="probe-the-bootstrap-token" />
+
+[Bootstrap-token verification](https://github.com/openclaw/openclaw/blob/main/.agents/skills/release-openclaw-maintainer/references/publication-recovery.md#check-the-bootstrap-token).
+
+<a id="prepare-once%2C-then-use-the-release-button" />
+<a id="prepare-once-then-use-the-release-button" />
+
+[Prepared publication](https://github.com/openclaw/openclaw/blob/main/.agents/skills/release-openclaw-maintainer/references/regular-release.md#prepared-publication).
+
+<a id="recover-a-failed-download" />
+
+[Interrupted preparation and publication](https://github.com/openclaw/openclaw/blob/main/.agents/skills/release-openclaw-maintainer/references/publication-recovery.md#interrupted-preparation-and-publication).
+
+<a id="direct-publication-and-owner-recovery" />
+
+[Published-version recovery](https://github.com/openclaw/openclaw/blob/main/.agents/skills/release-openclaw-maintainer/references/publication-recovery.md#published-version-failed-parent).
+
+<a id="npm-workflow-inputs" />
+<a id="regular-beta%2Flatest-stable-release-sequence" />
+<a id="regular-beta/latest-stable-release-sequence" />
+
+[Regular publication and verification](https://github.com/openclaw/openclaw/blob/main/.agents/skills/release-openclaw-maintainer/references/regular-release.md#publish-and-verify).
+
+<a id="publication-modes%3A-strict-default-and-operator-fast-path" />
+<a id="publication-modes-strict-default-and-operator-fast-path" />
+
+<a id="publication-requirements" />
+
+[Publication requirements](https://github.com/openclaw/openclaw/blob/main/.agents/skills/release-openclaw-ci/SKILL.md#publication-requirements).
+
+<a id="public-references" />
+<a id="related" />
+
+[Release workflow reference](/reference/full-release-validation).

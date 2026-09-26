@@ -1,11 +1,2 @@
-import type { OutboundSendDeps } from "../infra/outbound/deliver.js";
-import {
-  createOutboundSendDepsFromCliSource,
-  type CliOutboundSendSource,
-} from "./outbound-send-mapping.js";
-
-export type CliDeps = Required<CliOutboundSendSource>;
-
-export function createOutboundSendDeps(deps: CliDeps): OutboundSendDeps {
-  return createOutboundSendDepsFromCliSource(deps);
-}
+export type { CliDeps } from "./deps.types.js";
+export { createOutboundSendDepsFromCliSource as createOutboundSendDeps } from "./outbound-send-mapping.js";
